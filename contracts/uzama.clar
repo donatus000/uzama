@@ -7,6 +7,8 @@
 (define-constant ERR-RESOURCE-NOT-FOUND (err u105))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u106))
 (define-constant ERR-NO-EXISTING-ACCESS (err u107))
+(define-constant ERR-INVALID-AMOUNT (err u108))
+(define-constant ERR-INSUFFICIENT-CONTRACT-BALANCE (err u109))
 
 ;; Contract owner
 (define-constant CONTRACT-OWNER tx-sender)
@@ -21,6 +23,9 @@
 
 ;; Access permissions
 (define-map access (tuple (resource (string-ascii 64)) (user principal)) { expiry: uint })
+
+;; Track contract-held STX available for withdrawal
+(define-data-var contract-balance uint u0)
 
 ;; Owner-only function to configure resources
 (define-public (set-resource-config (resource (string-ascii 64)) (price-per-block uint) (min-period uint) (max-period uint))
@@ -38,6 +43,20 @@
     })
     (ok true)))
 
+;; Owner-only function to toggle resource availability without changing pricing
+(define-public (set-resource-active (resource (string-ascii 64)) (is-active bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> (len resource) u0) ERR-EMPTY-RESOURCE)
+    (let ((config (unwrap! (map-get? resource-config resource) ERR-RESOURCE-NOT-FOUND)))
+      (map-set resource-config resource {
+        price-per-block: (get price-per-block config),
+        min-period: (get min-period config),
+        max-period: (get max-period config),
+        active: is-active
+      })
+      (ok true))))
+
 ;; Buy access to a resource
 (define-public (buy-access (resource (string-ascii 64)) (period uint))
   (let ((config (unwrap! (map-get? resource-config resource) ERR-RESOURCE-NOT-FOUND)))
@@ -49,10 +68,18 @@
       (asserts! (<= period (get max-period config)) ERR-INVALID-PERIOD)
       
       ;; Calculate required payment
-      (let ((required-price (* (get price-per-block config) period)))
+      (let ((required-price (* (get price-per-block config) period))
+            (extension-base (match (map-get? access { resource: resource, user: tx-sender })
+                              current-access
+                              (let ((current-expiry (get expiry current-access)))
+                                (if (> current-expiry stacks-block-height)
+                                    current-expiry
+                                    stacks-block-height))
+                              stacks-block-height)))
         ;; Handle payment with proper error checking
         (unwrap! (stx-transfer? required-price tx-sender (as-contract tx-sender)) ERR-PAYMENT-FAILED)
-        (map-set access { resource: resource, user: tx-sender } { expiry: (+ stacks-block-height period) })
+        (map-set access { resource: resource, user: tx-sender } { expiry: (+ extension-base period) })
+        (var-set contract-balance (+ (var-get contract-balance) required-price))
         (ok true)))))
 
 ;; NEW: Extend existing access to a resource
@@ -76,13 +103,19 @@
         (unwrap! (stx-transfer? required-price tx-sender (as-contract tx-sender)) ERR-PAYMENT-FAILED)
         ;; Update access with extended expiry
         (map-set access { resource: resource, user: tx-sender } { expiry: (+ extension-base additional-period) })
+        (var-set contract-balance (+ (var-get contract-balance) required-price))
         (ok true)))))
 
 ;; Owner function to withdraw funds
 (define-public (withdraw (amount uint))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
-    (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER))))
+  (let ((available (var-get contract-balance)))
+    (begin
+      (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+      (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+      (asserts! (<= amount available) ERR-INSUFFICIENT-CONTRACT-BALANCE)
+      (unwrap! (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER)) ERR-PAYMENT-FAILED)
+      (var-set contract-balance (- available amount))
+      (ok true))))
 
 ;; Check if user has valid access to resource
 (define-read-only (has-access (resource (string-ascii 64)) (user principal))
